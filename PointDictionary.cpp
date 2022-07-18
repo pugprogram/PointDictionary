@@ -132,4 +132,46 @@ ColumnUInt8::Ptr IPointDictionary::hasKeys(const Columns& key_columns, const Dat
     found_count.fetch_add(keys_found, std::memory_order_relaxed);
     return result;
 }
+
+
+void IPointDictionary::blockToAttributes(const DB::Block& block)
+{
+    const auto rows = block.rows();
+    size_t skip_key_column_offset = 1;
+    for (size_t i = 0; i < attributes_columns.size(); ++i)
+    {
+        const auto& block_column = block.safeGetByPosition(i + skip_key_column_offset);
+        const auto& column = block_column.column;
+        attributes_columns[i]->assumeMutable()->insertRangeFrom(*column, 0, column->size());
+    }
+    
+    points.reserve(points.size() + rows);
+    polint_index_to_attribute_value_index.reserve(point_index_to_attribute_value_index.size() + rows);
+    const auto& key_column = block.safeGetByPosition(0).column;
+    if (configuration.store_point_key_column)
+        key_attribute_column->assumeMutable()->insertRangeFrom(*key_column, 0, key_column->size());
+    extractPoints(key_column);
+}
+
+void IPointDictionary::loadData()
+{
+    QueryPipeline pipeline(source_ptr->loadAll());
+    PullingPipelineExecutor executor(pipeline);
+    Block block;
+    while (executor.pull(block))
+        blockToAttributes(block);
+}
+
+
+
+void IPointDictionary::calculateBytesAllocated()
+{
+    if (configuration.store_point_key_column)
+        bytes_allocated += key_attribute_column->allocatedBytes();
+    for (const auto& column : attributes_columns)
+        bytes_allocated += column->allocatedBytes();
+    for (auto& point : points)
+        bytes_allocated += 2 * sizeof(Points);
+}
+
 }
