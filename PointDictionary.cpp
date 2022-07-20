@@ -210,8 +210,7 @@ namespace DB
                 ids.push_back((ids.empty() ? 0 : ids.back() + new_tuple_points));
             }
             void AddPoint(IPointDictionary::Coord x, IPointDictionary::Coord y) {
-                auto& lastpoint = dest.back();
-                lastpoint.emplace_back(&x, &y);
+                dest.emplace_back(&x, &y);
             }
         };
 
@@ -265,7 +264,7 @@ namespace DB
         switch (configuration.input_type)
         {
         case InputType::Tuple:
-            AddPointsbytuple(column, data);
+            AddPointsbyTuple(column, data);
             break;
         case InputType::Array:
             AddPointsbyArray(column, data);
