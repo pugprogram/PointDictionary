@@ -18,13 +18,14 @@ namespace DB
 
         enum class InputType
         {
-           Tuple
+           Tuple,
+           Array,
         };
         struct Configuration
         {
             InputType input_type = InputType::Array;
             
-            bool store_points_key_column = false;
+            bool store_point_key_column = false;
         };
         IPointDictionary(
             const StorageID& dict_id_,
@@ -76,8 +77,8 @@ namespace DB
     protected:
 
         
-        virtual bool find(const Point& point, std::vector<size_t>& points_index) const = 0;
-        std::vector<Polygon> polygons;
+        virtual bool find(const Polygon& polygon, std::vector<size_t>& points_index) const = 0;
+        std::vector<Point> points;
         const DictionaryStructure dict_struct;
         const DictionarySourcePtr source_ptr;
         const DictionaryLifetime dict_lifetime;
