@@ -51,8 +51,8 @@ namespace DB
         const DictionaryStructure& getStructure() const override { return dict_struct; }
         const DictionaryLifetime& getLifetime() const override { return dict_lifetime; }
         bool isInjective(const std::string& attribute_name) const override { return dict_struct.getAttribute(attribute_name).injective; }
-        DictionaryKeyType getKeyType() const override { return DictionaryKeyType::Complex; }
-        void convertKeyColumns(Columns& key_columns, DataTypes& key_types) const override;
+        DictionaryKeyType getKeyType() const override { return DictionaryKeyType::Complex;}
+        
         ColumnPtr getColumn(
             const std::string& attribute_name,
             const DataTypePtr& result_type,
