@@ -37,6 +37,74 @@ namespace DB
         calculateBytesAllocated();
     }
 
+
+    ColumnPtr IPointDictionary::getColumn(
+        const std::string& attribute_name,
+        const DataTypePtr& result_type,
+        const Columns& key_columns,
+        const DataTypes&,
+        const ColumnPtr& default_values_column) const
+    {
+        const auto requested_key_polygons = extractPolygons(key_columns);
+        const auto& attribute = dict_struct.getAttribute(attribute_name, result_type);
+        DefaultValueProvider default_value_provider(attribute.null_value, default_values_column);
+        size_t attribute_index = dict_struct.attribute_name_to_index.find(attribute_name)->second;
+        const auto& attribute_values_column = attributes_columns[attribute_index];
+        auto result = attribute_values_column->cloneEmpty();
+        result->reserve(requested_key_points.size());
+        if (unlikely(attribute.is_nullable))
+        {
+            getItemsImpl<Field>(
+                requested_key_polygons,
+                [&](size_t row) { return (*attribute_values_column)[row]; },
+                [&](Field& value) { result->insert(value); },
+                default_value_provider);
+        }
+        else
+        {
+            auto type_call = [&](const auto& dictionary_attribute_type)
+            {
+                using Type = std::decay_t<decltype(dictionary_attribute_type)>;
+                using AttributeType = typename Type::AttributeType;
+                using ValueType = DictionaryValueType<AttributeType>;
+                using ColumnProvider = DictionaryAttributeColumnProvider<AttributeType>;
+                using ColumnType = typename ColumnProvider::ColumnType;
+                const auto attribute_values_column_typed = typeid_cast<const ColumnType*>(attribute_values_column.get());
+                if (!attribute_values_column_typed)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "An attribute type should be same as dictionary type");
+                ColumnType& result_column_typed = static_cast<ColumnType&>(*result);
+                if constexpr (std::is_same_v<ValueType, Array>)
+                {
+                    getItemsImpl<ValueType>(
+                        requested_key_polygons,
+                        [&](size_t row) { return (*attribute_values_column)[row].get<Array>(); },
+                        [&](Array& value) { result_column_typed.insert(value); },
+                        default_value_provider);
+                }
+                else if constexpr (std::is_same_v<ValueType, StringRef>)
+                {
+                    getItemsImpl<ValueType>(
+                        requested_key_polygons,
+                        [&](size_t row) { return attribute_values_column->getDataAt(row); },
+                        [&](StringRef value) { result_column_typed.insertData(value.data, value.size); },
+                        default_value_provider);
+                }
+                else
+                {
+                    auto& attribute_data = attribute_values_column_typed->getData();
+                    auto& result_data = result_column_typed.getData();
+                    getItemsImpl<ValueType>(
+                        requested_key_polygons,
+                        [&](size_t row) { return attribute_data[row]; },
+                        [&](auto value) { result_data.emplace_back(value); },
+                        default_value_provider);
+                }
+            };
+            callOnDictionaryAttributeType(attribute.underlying_type, type_call);
+        }
+        return result;
+    }
+
     Pipe IPointDictionary::read(const Names& column_names, size_t, size_t) const
     {
         if (!configuration.store_point_key_column)
@@ -67,7 +135,6 @@ namespace DB
         auto source = std::make_shared<SourceFromSingleChunk>(Block(result_columns));
         return Pipe(std::move(source));
     }
-    
 
     void IPointDictionary::setup()
     {
@@ -126,10 +193,209 @@ namespace DB
         bytes_allocated = points.size() * 2 * sizeof(Point);
     }
 
-   
+    struct Datapolygon
+    {
+        std::vector<IPointDictionary::Polygon>& dest;
+
+        void addPolygon(bool new_multi_polygon = false)
+        {
+            dest.emplace_back();
+           
+        }
+        void addPoint(IPointDictionary::Coord x, IPointDictionary::Coord y)
+        {
+            auto& last_polygon = dest.back();
+            auto& last_ring = (last_polygon.inners().empty() ? last_polygon.outer() : last_polygon.inners().back());
+            last_ring.emplace_back(x, y);
+        }
+    };
+
+    struct Offset
+    {
+        Offset() = default;
+        IColumn::Offsets ring_offsets;
+        IColumn::Offsets polygon_offsets;
+        IColumn::Offsets multi_polygon_offsets;
+        IColumn::Offset points_added = 0;
+        IColumn::Offset current_ring = 0;
+        IColumn::Offset current_polygon = 0;
+        IColumn::Offset current_multi_polygon = 0;
+        Offset& operator++()
+        {
+            ++points_added;
+            if (points_added <= ring_offsets[current_ring])
+                return *this;
+            ++current_ring;
+            if (current_ring < polygon_offsets[current_polygon])
+                return *this;
+            ++current_polygon;
+            if (current_polygon < multi_polygon_offsets[current_multi_polygon])
+                return *this;
+            ++current_multi_polygon;
+            return *this;
+        }
+        bool atLastPolygonOfMultiPolygon() { return current_polygon + 1 == multi_polygon_offsets[current_multi_polygon]; }
+        bool atLastRingOfPolygon() { return current_ring + 1 == polygon_offsets[current_polygon]; }
+        bool atLastPointOfRing() { return points_added == ring_offsets[current_ring]; }
+        bool allRingsHaveAPositiveArea()
+        {
+            IColumn::Offset prev_offset = 0;
+            for (const auto offset : ring_offsets)
+            {
+                if (offset - prev_offset < 3)
+                    return false;
+                prev_offset = offset;
+            }
+            return true;
+        }
+    };
+
+    std::vector<IPointDictionary::Polygon> IPointDictionary::extractPolygons(const Columns& key_columns)
+    {
+        std::vector<Polygon> result;
+        const auto rows = key_columns.front()->size();
+        result.reserve(rows);
+        Datapolygon data = {result};
+        Offset offset;
+        const IColumn* points_collection = nullptr;
+        const auto* ptr_multi_polygons = typeid_cast<const ColumnArray*>(column.get());
+        if (!ptr_multi_polygons)
+            throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected a column containing arrays of points or array of polygons");
+        const auto* ptr_polygons = typeid_cast<const ColumnArray*>(&ptr_multi_polygons->getData());
+        const auto* ptr_rings = typeid_cast<typeid_cast<const ColumnArray*>(&ptr_polygons->getData());
+        if (!ptr_rings) {
+            offset.ring_offsets.assign(ptr_multi_polygons->getOffsets());
+            std::iota(offset.polygon_offsets.begin(), offset.polygon_offsets.end(), 1);
+            offset.multi_polygon_offsets.assign(offset.polygon_offsets);
+            points_collection= ptr_multi_polygons->getDataPtr().get();
+            const auto* ptr_points = typeid_cast<const ColumnArray*>(points_collection);
+            if (!ptr_points) {
+                const auto* ptr_points1 = typeid_cast<const ColumnTuple*>(points_collection);
+                if (!ptr_points1)
+                    throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected a column of tuples representing points or a column of arrays of points");
+                if (ptr_points1->tupleSize() != 2)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Points should be two-dimensional");
+                const auto* column_x = typeid_cast<const ColumnVector<Float64>*>(&ptr_points1->getColumn(0));
+                const auto* column_y = typeid_cast<const ColumnVector<Float64>*>(&ptr_points1->getColumn(1));
+                if (!column_x || !column_y)
+                    throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected coordinates to be of type Float64");
+                for (size_t i = 0; i < column_x->size(); ++i)
+                {
+                    if (offset.atLastPointOfRing())
+                    {
+                        if (offset.atLastRingOfPolygon())
+                            data.addPolygon(offset.atLastPolygonOfMultiPolygon());
+                        else
+                        {
+                            /** An outer ring is added automatically with a new polygon, thus we need the else statement here.
+                             *  This also implies that if we are at this point we have to add an inner ring.
+                             */
+                            auto& last_polygon = data.dest.back();
+                            last_polygon.inners().emplace_back();
+                        }
+                    }
+                    data.addPoint(column_x->getElement(i), column_y->getElement(i));
+                    ++offset;
+                }
+            }
+            
+            const auto* ptr_coord = typeid_cast<const ColumnVector<Float64>*>(&ptr_points->getData());
+            if (!ptr_coord)
+                throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected coordinates to be of type Float64");
+            const auto& offsets = ptr_points->getOffsets();
+            IColumn::Offset prev_offset = 0;
+            for (size_t i = 0; i < offsets.size(); ++i)
+            {
+                if (offsets[i] - prev_offset != 2)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "All points should be two-dimensional");
+                prev_offset = offsets[i];
+                if (offset.atLastPointOfRing())
+                {
+                    if (offset.atLastRingOfPolygon())
+                        data.addPolygon(offset.atLastPolygonOfMultiPolygon());
+                    else
+                    {
+                       
+                        auto& last_polygon = data.dest.back();
+                        last_polygon.inners().emplace_back();
+                    }
+                }
+                data.addPoint(ptr_coord->getElement(2 * i), ptr_coord->getElement(2 * i + 1));
+                ++offset;
+                
+            }
+        }
+        offset.multi_polygon_offsets.assign(ptr_multi_polygons->getOffsets());
+        if (!ptr_polygons)
+            throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected a column containing arrays of rings when reading polygons");
+        offset.polygon_offsets.assign(ptr_polygons->getOffsets());
+        if (!ptr_rings)
+            throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected a column containing arrays of points when reading rings");
+        offset.ring_offsets.assign(ptr_rings->getOffsets());
+        points_collection = ptr_rings->getDataPtr().get();
+        const auto* ptr_points = typeid_cast<const ColumnArray*>(points_collection);
+        if (!ptr_points) {
+            const auto* ptr_points3 = typeid_cast<const ColumnTuple*>(points_collection);
+            if (!ptr_points3)
+                throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected a column of tuples representing points");
+            if (ptr_points3->tupleSize() != 2)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Points should be two-dimensional");
+            const auto* column_x = typeid_cast<const ColumnVector<Float64>*>(&ptr_points3->getColumn(0));
+            const auto* column_y = typeid_cast<const ColumnVector<Float64>*>(&ptr_points3->getColumn(1));
+            if (!column_x || !column_y)
+                throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected coordinates to be of type Float64");
+            for (size_t i = 0; i < column_x->size(); ++i)
+            {
+                if (offset.atLastPointOfRing())
+                {
+                    if (offset.atLastRingOfPolygon())
+                        data.addPolygon(offset.atLastPolygonOfMultiPolygon());
+                    else
+                    {
+                        /** An outer ring is added automatically with a new polygon, thus we need the else statement here.
+                         *  This also implies that if we are at this point we have to add an inner ring.
+                         */
+                        auto& last_polygon = data.dest.back();
+                        last_polygon.inners().emplace_back();
+                    }
+                }
+                data.addPoint(column_x->getElement(i), column_y->getElement(i));
+                ++offset;
+               
+            }
+        }
+        const auto* ptr_coord = typeid_cast<const ColumnVector<Float64>*>(&ptr_points->getData());
+        if (!ptr_coord)
+            throw Exception(ErrorCodes::TYPE_MISMATCH, "Expected coordinates to be of type Float64");
+        const auto& offsets = ptr_points->getOffsets();
+        IColumn::Offset prev_offset = 0;
+        for (size_t i = 0; i < offsets.size(); ++i)
+        {
+            if (offsets[i] - prev_offset != 2)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "All points should be two-dimensional");
+            prev_offset = offsets[i];
+            if (offset.atLastPointOfRing())
+            {
+                if (offset.atLastRingOfPolygon())
+                    data.addPolygon(offset.atLastPolygonOfMultiPolygon());
+                else
+                {
+                    /** An outer ring is added automatically with a new polygon, thus we need the else statement here.
+                     *  This also implies that if we are at this point we have to add an inner ring.
+                     */
+                    auto& last_polygon = data.dest.back();
+                    last_polygon.inners().emplace_back();
+                }
+            }
+            data.addPoint(ptr_coord->getElement(2 * i), ptr_coord->getElement(2 * i + 1));
+            ++offset;
+        }
+        return result;
+    }
+
     ColumnUInt8::Ptr IPointDictionary::hasKeys(const Columns& key_columns, const DataTypes&) const
     {
-        std::vector<IPolygonDictionary::Polygon> polygons = extractPolygons(key_columns);
+        std::vector<IPointDictionary::Polygon> polygons = extractPolygons(key_columns);
         auto result = ColumnUInt8::create(polygons.size());
         auto& out = result->getData();
         size_t keys_found = 0;
@@ -149,7 +415,7 @@ namespace DB
 
     template <typename AttributeType, typename ValueGetter, typename ValueSetter, typename DefaultValueExtractor>
     void IPointDictionary::getItemsImpl(
-        const std::vector<IPointDictionary::>& requested_key_polygons,
+        const std::vector<IPointDictionary::Polygon>& requested_key_polygons,
         ValueGetter&& get_value,
         ValueSetter&& set_value,
         DefaultValueExtractor& default_value_extractor) const
@@ -210,6 +476,7 @@ namespace DB
                 ids.push_back((ids.empty() ? 0 : ids.back() + new_tuple_points));
             }
             void AddPoint(IPointDictionary::Coord x, IPointDictionary::Coord y) {
+                
                 dest.emplace_back(&x, &y);
             }
         };
@@ -264,7 +531,7 @@ namespace DB
         switch (configuration.input_type)
         {
         case InputType::Tuple:
-            AddPointsbyTuple(column, data);
+            AddPointsbytuple(column, data);
             break;
         case InputType::Array:
             AddPointsbyArray(column, data);
