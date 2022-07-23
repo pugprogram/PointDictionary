@@ -399,13 +399,14 @@ namespace DB
         auto result = ColumnUInt8::create(polygons.size());
         auto& out = result->getData();
         size_t keys_found = 0;
+        std::vector<size_t>findpoint;
         for (size_t i = 0; i < polygons.size(); ++i)
         {
-            size_t unused_find_result = 0;
             auto& polygon = polygons[i];
-            out[i] = find(polygon, unused_find_result);
-            keys_found += out[i];
+            out[i] = find(polygon, findpoint);
+            
         }
+        keys_found=findpoint.size();
         query_count.fetch_add(polygons.size(), std::memory_order_relaxed);
         found_count.fetch_add(keys_found, std::memory_order_relaxed);
         return result;
@@ -425,13 +426,16 @@ namespace DB
 
         for (size_t requested_key_index = 0; requested_key_index < requested_key_polygons.size(); ++requested_key_index)
         {
-            const auto found = find(requested_key_polygons[requested_key_index], point_index);
+            std::vector<size_t>findpoint;
+            const auto found = find(requested_key_polygons[requested_key_index],findpoint);
             if (found)
             {
+                for (size_t i=0;i<findpoint.size();i++){
                 size_t attribute_values_index = point_index_to_attribute_value_index[point_index];
                 auto value = get_value(attribute_values_index);
                 set_value(value);
                 ++keys_found;
+                }
             }
             else
             {
@@ -454,6 +458,8 @@ namespace DB
                     set_value(default_value.get<NearestFieldType<AttributeType>>());
                 }
             }
+            findpoint.clear();
+            findpoint.shrink_to_fit();
         }
         query_count.fetch_add(requested_key_polygons.size(), std::memory_order_relaxed);
         found_count.fetch_add(keys_found, std::memory_order_relaxed);
